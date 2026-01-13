@@ -155,30 +155,77 @@ class SMPLSequence(Node):
         self.vertices, self.joints, self.faces, self.skeleton = self.fk()
 
         if self._is_rigged:
-            self.skeleton_seq = Skeletons(
-                self.joints,
-                self.skeleton,
-                gui_affine=False,
-                color=(1.0, 177 / 255, 1 / 255, 1.0),
-                name="Skeleton",
-            )
+            # For SMPLX/SMPLH, use smaller radius for all joints
+            if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                self.skeleton_seq = Skeletons(
+                    self.joints,
+                    self.skeleton,
+                    radius=0.005,  # smaller radius for all joints
+                    gui_affine=False,
+                    color=(1.0, 177 / 255, 1 / 255, 1.0),
+                    name="Skeleton",
+                )
+            else:
+                self.skeleton_seq = Skeletons(
+                    self.joints,
+                    self.skeleton,
+                    gui_affine=False,
+                    color=(1.0, 177 / 255, 1 / 255, 1.0),
+                    name="Skeleton",
+                )
             self._add_node(self.skeleton_seq)
 
         # First convert the relative joint angles to global joint angles in rotation matrix form.
         if self.smpl_layer.model_type != "flame":
+            if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                poses_parts = [self.poses_root, self.poses_body]
+                if self.smpl_layer.model_type == "smplx":
+                    # Insert zero rotations for joint 22-24 (jaw, eyes) to match skeleton
+                    batch_size = self.poses_root.shape[0]
+                    device = self.poses_root.device
+                    dtype = self.poses_root.dtype
+                    zero_rotations_22_24 = torch.zeros((batch_size, 9), dtype=dtype, device=device)
+                    poses_parts.append(zero_rotations_22_24)
+                if self.poses_left_hand is not None:
+                    poses_parts.append(self.poses_left_hand)
+                if self.poses_right_hand is not None:
+                    poses_parts.append(self.poses_right_hand)
+                poses_for_global = torch.cat(poses_parts, dim=-1)
+                skeleton_for_global = self.smpl_layer.skeletons()["all"].T[:, 0]
+            else:
+                poses_for_global = torch.cat([self.poses_root, self.poses_body], dim=-1)
+                skeleton_for_global = self.skeleton[:, 0]
+            
             global_oris = local_to_global(
-                torch.cat([self.poses_root, self.poses_body], dim=-1),
-                self.skeleton[:, 0],
+                poses_for_global,
+                skeleton_for_global,
                 output_format="rotmat",
             )
             global_oris = c2c(global_oris.reshape((self.n_frames, -1, 3, 3)))
+
+            # Ensure global_oris has the same number of joints as self.joints
+            if global_oris.shape[1] != self.joints.shape[1]:
+                # Pad or truncate to match joints
+                n_joints = self.joints.shape[1]
+                n_global_oris = global_oris.shape[1]
+                if n_global_oris < n_joints:
+                    # Pad with identity matrices
+                    padding = np.tile(np.eye(3)[np.newaxis, np.newaxis, :, :], (self.n_frames, n_joints - n_global_oris, 1, 1))
+                    global_oris = np.concatenate([global_oris, padding], axis=1)
+                else:
+                    # Truncate to match joints
+                    global_oris = global_oris[:, :n_joints]
         else:
             global_oris = np.tile(np.eye(3), self.joints.shape[:-1])[np.newaxis]
 
         if self._z_up and not C.z_up:
             self.rotation = np.matmul(np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]), self.rotation)
 
-        self.rbs = RigidBodies(self.joints, global_oris, length=0.1, gui_affine=False, name="Joint Angles")
+        # For SMPLX/SMPLH, use smaller radius and length for all joints
+        if self.smpl_layer.model_type in ["smplx", "smplh"]:
+            self.rbs = RigidBodies(self.joints, global_oris, radius=0.005, length=0.03, gui_affine=False, name="Joint Angles")
+        else:
+            self.rbs = RigidBodies(self.joints, global_oris, length=0.1, gui_affine=False, name="Joint Angles")
         self._add_node(self.rbs, enabled=self._show_joint_angles)
 
         self.mesh_seq = Meshes(
@@ -372,17 +419,39 @@ class SMPLSequence(Node):
             # Use current frame data.
             if self._edit_mode:
                 poses_root = self._edit_pose[:3][None, :]
-                poses_body = self._edit_pose[3:][None, :]
+                if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                    body_size = self.poses_body.shape[1]
+                    poses_body = self._edit_pose[3:3+body_size][None, :]
+                    offset = 3 + body_size
+                    if self.poses_left_hand is not None:
+                        hand_size = self.poses_left_hand.shape[1]
+                        poses_left_hand = self._edit_pose[offset:offset+hand_size][None, :]
+                        offset += hand_size
+                    else:
+                        poses_left_hand = None
+                    if self.poses_right_hand is not None:
+                        hand_size = self.poses_right_hand.shape[1]
+                        poses_right_hand = self._edit_pose[offset:offset+hand_size][None, :]
+                    else:
+                        poses_right_hand = None
+                else:
+                    poses_body = self._edit_pose[3:][None, :]
+                    poses_left_hand = (
+                        None if self.poses_left_hand is None else self.poses_left_hand[self.current_frame_id][None, :]
+                    )
+                    poses_right_hand = (
+                        None if self.poses_right_hand is None else self.poses_right_hand[self.current_frame_id][None, :]
+                    )
             else:
                 poses_body = self.poses_body[self.current_frame_id][None, :]
                 poses_root = self.poses_root[self.current_frame_id][None, :]
 
-            poses_left_hand = (
-                None if self.poses_left_hand is None else self.poses_left_hand[self.current_frame_id][None, :]
-            )
-            poses_right_hand = (
-                None if self.poses_right_hand is None else self.poses_right_hand[self.current_frame_id][None, :]
-            )
+                poses_left_hand = (
+                    None if self.poses_left_hand is None else self.poses_left_hand[self.current_frame_id][None, :]
+                )
+                poses_right_hand = (
+                    None if self.poses_right_hand is None else self.poses_right_hand[self.current_frame_id][None, :]
+                )
             trans = self.trans[self.current_frame_id][None, :]
 
             if self.betas.shape[0] == self.n_frames:
@@ -396,7 +465,19 @@ class SMPLSequence(Node):
                 poses_body = self.poses_body.clone()
 
                 poses_root[self.current_frame_id] = self._edit_pose[:3]
-                poses_body[self.current_frame_id] = self._edit_pose[3:]
+                if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                    body_size = self.poses_body.shape[1]
+                    poses_body[self.current_frame_id] = self._edit_pose[3:3+body_size]
+                    offset = 3 + body_size
+                    if self.poses_left_hand is not None:
+                        hand_size = self.poses_left_hand.shape[1]
+                        self.poses_left_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+                        offset += hand_size
+                    if self.poses_right_hand is not None:
+                        hand_size = self.poses_right_hand.shape[1]
+                        self.poses_right_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+                else:
+                    poses_body[self.current_frame_id] = self._edit_pose[3:]
             else:
                 poses_body = self.poses_body
                 poses_root = self.poses_root
@@ -419,9 +500,13 @@ class SMPLSequence(Node):
         if self.post_fk_func:
             verts, joints = self.post_fk_func(self, verts, joints, current_frame_only)
 
-        skeleton = self.smpl_layer.skeletons()["body"].T
+        if self.smpl_layer.model_type in ["smplx", "smplh"]:
+            skeleton = self.smpl_layer.skeletons()["all"].T
+        else:
+            skeleton = self.smpl_layer.skeletons()["body"].T
         faces = self.smpl_layer.bm.faces.astype(np.int64)
-        joints = joints[:, : skeleton.shape[0]]
+        if self.smpl_layer.model_type not in ["smplx", "smplh"]:
+            joints = joints[:, : skeleton.shape[0]]
 
         if current_frame_only:
             return c2c(verts)[0], c2c(joints)[0], c2c(faces), c2c(skeleton)
@@ -456,17 +541,29 @@ class SMPLSequence(Node):
 
         self.redraw()
 
+    def _build_edit_pose(self):
+        """Build _edit_pose from current frame poses, including hand poses for SMPLX/SMPLH if provided."""
+        if self.smpl_layer.model_type in ["smplx", "smplh"]:
+            edit_pose_parts = [self.poses_root[self.current_frame_id], self.poses_body[self.current_frame_id]]
+            if self.poses_left_hand is not None:
+                edit_pose_parts.append(self.poses_left_hand[self.current_frame_id])
+            if self.poses_right_hand is not None:
+                edit_pose_parts.append(self.poses_right_hand[self.current_frame_id])
+            return torch.cat(edit_pose_parts, dim=-1)
+        else:
+            return self.poses[self.current_frame_id].clone()
+
     @hooked
     def on_before_frame_update(self):
         if self._edit_mode and self._edit_pose_dirty:
-            self._edit_pose = self.poses[self.current_frame_id].clone()
+            self._edit_pose = self._build_edit_pose()
             self.redraw(current_frame_only=True)
             self._edit_pose_dirty = False
 
     @hooked
     def on_frame_update(self):
         if self.edit_mode:
-            self._edit_pose = self.poses[self.current_frame_id].clone()
+            self._edit_pose = self._build_edit_pose()
             self._edit_pose_dirty = False
 
     def redraw(self, **kwargs):
@@ -496,8 +593,50 @@ class SMPLSequence(Node):
 
             # Update rigid bodies.
             if self.smpl_layer.model_type != "flame":
-                global_oris = local_to_global(pose, self.skeleton[:, 0], output_format="rotmat")
+                if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                    if self._edit_mode:
+                        poses_parts = [self._edit_pose[:3]]
+                        poses_parts.append(self._edit_pose[3:3+63])
+                        if self.smpl_layer.model_type == "smplx":
+                            zero_rotations_22_24 = torch.zeros(9, dtype=self._edit_pose.dtype, device=self._edit_pose.device)
+                            poses_parts.append(zero_rotations_22_24)
+                        offset = 3 + 63
+                        if self.poses_left_hand is not None:
+                            hand_size = self.poses_left_hand.shape[1]
+                            poses_parts.append(self._edit_pose[offset:offset+hand_size])
+                            offset += hand_size
+                        if self.poses_right_hand is not None:
+                            hand_size = self.poses_right_hand.shape[1]
+                            poses_parts.append(self._edit_pose[offset:offset+hand_size])
+                        pose_for_global = torch.cat(poses_parts, dim=-1)
+                    else:
+                        poses_parts = [self.poses_root[self.current_frame_id], self.poses_body[self.current_frame_id]]
+                        if self.smpl_layer.model_type == "smplx":
+                            zero_rotations_22_24 = torch.zeros(9, dtype=self.poses_root.dtype, device=self.poses_root.device)
+                            poses_parts.append(zero_rotations_22_24)
+                        if self.poses_left_hand is not None:
+                            poses_parts.append(self.poses_left_hand[self.current_frame_id])
+                        if self.poses_right_hand is not None:
+                            poses_parts.append(self.poses_right_hand[self.current_frame_id])
+                        pose_for_global = torch.cat(poses_parts, dim=-1)
+
+                    skeleton_for_global = self.smpl_layer.skeletons()["all"].T[:, 0]
+                else:
+                    pose_for_global = pose
+                    skeleton_for_global = self.skeleton[:, 0]
+
+                global_oris = local_to_global(pose_for_global, skeleton_for_global, output_format="rotmat")
                 global_oris = global_oris.reshape((-1, 3, 3))
+
+                n_joints = self.joints[self.current_frame_id].shape[0]
+                n_global_oris = global_oris.shape[0]
+                if n_global_oris < n_joints:
+                    # Pad with identity matrices for joints beyond 55
+                    padding = np.tile(np.eye(3)[np.newaxis, :, :], (n_joints - n_global_oris, 1, 1))
+                    global_oris = np.concatenate([global_oris, padding], axis=0)
+                elif n_global_oris > n_joints:
+                    # Truncate to match joints
+                    global_oris = global_oris[:n_joints]
                 self.rbs.current_rb_ori = c2c(global_oris)
             self.rbs.current_rb_pos = self.joints[self.current_frame_id]
 
@@ -517,19 +656,56 @@ class SMPLSequence(Node):
                 poses_body = self.poses_body.clone()
 
                 poses_root[self.current_frame_id] = self._edit_pose[:3]
-                poses_body[self.current_frame_id] = self._edit_pose[3:]
+                if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                    body_size = self.poses_body.shape[1]
+                    poses_body[self.current_frame_id] = self._edit_pose[3:3+body_size]
+                    offset = 3 + body_size
+                    if self.poses_left_hand is not None:
+                        hand_size = self.poses_left_hand.shape[1]
+                        self.poses_left_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+                        offset += hand_size
+                    if self.poses_right_hand is not None:
+                        hand_size = self.poses_right_hand.shape[1]
+                        self.poses_right_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+                else:
+                    poses_body[self.current_frame_id] = self._edit_pose[3:]
             else:
                 poses_body = self.poses_body
                 poses_root = self.poses_root
 
             # Update rigid bodies.
             if self.smpl_layer.model_type != "flame":
+                if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                    poses_for_global = [poses_root, poses_body]
+                    if self.smpl_layer.model_type == "smplx":
+                        zero_rotations_22_24 = torch.zeros((poses_body.shape[0], 9), dtype=self.poses_root.dtype, device=self.poses_root.device)
+                        poses_for_global.append(zero_rotations_22_24)
+                    if self.poses_left_hand is not None:
+                        poses_for_global.append(self.poses_left_hand)
+                    if self.poses_right_hand is not None:
+                        poses_for_global.append(self.poses_right_hand)
+                    poses_for_global = torch.cat(poses_for_global, dim=-1)
+                    skeleton_for_global = self.smpl_layer.skeletons()["all"].T[:, 0]
+                else:
+                    poses_for_global = torch.cat([poses_root, poses_body], dim=-1)
+                    skeleton_for_global = self.skeleton[:, 0]
                 global_oris = local_to_global(
-                    torch.cat([poses_root, poses_body], dim=-1),
-                    self.skeleton[:, 0],
+                    poses_for_global,
+                    skeleton_for_global,
                     output_format="rotmat",
                 )
                 global_oris = global_oris.reshape((self.n_frames, -1, 3, 3))
+                # Ensure global_oris has the same number of joints as joints
+                if global_oris.shape[1] != self.joints.shape[1]:
+                    n_joints = self.joints.shape[1]
+                    n_global_oris = global_oris.shape[1]
+                    if n_global_oris < n_joints:
+                        # Pad with identity matrices
+                        padding = np.tile(np.eye(3)[np.newaxis, np.newaxis, :, :], (self.n_frames, n_joints - n_global_oris, 1, 1))
+                        global_oris = np.concatenate([global_oris, padding], axis=1)
+                    else:
+                        # Truncate to match joints
+                        global_oris = global_oris[:, :n_joints]
                 self.rbs.rb_ori = c2c(global_oris)
             self.rbs.rb_pos = self.joints
 
@@ -555,7 +731,7 @@ class SMPLSequence(Node):
         if self.selected_mode == "edit":
             self.rbs.enabled = True
             self.rbs.is_selectable = False
-            self._edit_pose = self.poses[self.current_frame_id].clone()
+            self._edit_pose = self._build_edit_pose()
 
             # Disable picking for the mesh
             self.mesh_seq.backface_fragmap = True
@@ -584,6 +760,69 @@ class SMPLSequence(Node):
             if j < len(JOINT_NAMES):
                 name = JOINT_NAMES[j]
 
+        # Calculate pose_idx for edit_pose access
+        if self.smpl_layer.model_type == "smplx":
+            # SMPLX: joint 22-24 (face) are not in _edit_pose, so hand joints need offset
+            if j <= 21:
+                pose_idx = j
+            elif j >= 25 and j <= 39:
+                pose_idx = j - 3  # Left hand: skip joints 22-24
+            elif j >= 40 and j <= 54:
+                pose_idx = j - 3  # Right hand: skip joints 22-24
+            else:
+                pose_idx = -1  # Face joints: not editable
+        elif self.smpl_layer.model_type == "smplh":
+            pose_idx = j
+        else:
+            pose_idx = j
+        if self._edit_pose is None:
+            if tree:
+                e = imgui.tree_node(f"{j} - {name}")
+                if e:
+                    imgui.text("This joint is not editable (edit_pose not initialized)")
+                    imgui.tree_pop()
+            else:
+                imgui.text(f"{j} - {name} (not editable)")
+            return
+
+        max_pose_idx = self._edit_pose.shape[0] // 3
+        if self.smpl_layer.model_type == "smplx":
+            if pose_idx == -1:
+                if tree:
+                    e = imgui.tree_node(f"{j} - {name}")
+                    if e:
+                        imgui.text("This joint is not editable (face joint)")
+                        imgui.tree_pop()
+                else:
+                    imgui.text(f"{j} - {name} (not editable)")
+                return
+        elif self.smpl_layer.model_type == "smplh":
+            expected_editable_joints = 1 + 21
+            if self.poses_left_hand is not None:
+                expected_editable_joints += 15
+            if self.poses_right_hand is not None:
+                expected_editable_joints += 15
+
+            if j >= expected_editable_joints:
+                if tree:
+                    e = imgui.tree_node(f"{j} - {name}")
+                    if e:
+                        imgui.text("This joint is not editable")
+                        imgui.tree_pop()
+                else:
+                    imgui.text(f"{j} - {name} (not editable)")
+                return
+        else:
+            if pose_idx >= max_pose_idx:
+                if tree:
+                    e = imgui.tree_node(f"{j} - {name}")
+                    if e:
+                        imgui.text("This joint is not editable")
+                        imgui.tree_pop()
+                else:
+                    imgui.text(f"{j} - {name} (not editable)")
+                return
+
         if tree:
             e = imgui.tree_node(f"{j} - {name}")
         else:
@@ -591,8 +830,14 @@ class SMPLSequence(Node):
             imgui.text(f"{j} - {name}")
 
         if e:
-            # Euler angles sliders.
-            aa = self._edit_pose[j * 3 : (j + 1) * 3].cpu().numpy()
+            aa = self._edit_pose[pose_idx * 3 : (pose_idx + 1) * 3].cpu().numpy()
+
+            if aa.size == 0:
+                imgui.text("This joint is not editable")
+                if tree:
+                    imgui.tree_pop()
+                return
+
             euler = aa2euler_numpy(aa, degrees=True)
 
             _, self._edit_local_axes = imgui.checkbox("Local axes", self._edit_local_axes)
@@ -626,7 +871,7 @@ class SMPLSequence(Node):
                         # Rotate the current joint and convert back to axis angle.
                         aa = Rotation.as_rotvec(rot * base)
 
-                        self._edit_pose[j * 3 : (j + 1) * 3] = torch.from_numpy(aa)
+                        self._edit_pose[pose_idx * 3 : (pose_idx + 1) * 3] = torch.from_numpy(aa)
                         self._edit_pose_dirty = True
                         self.redraw(current_frame_only=True)
 
@@ -637,7 +882,7 @@ class SMPLSequence(Node):
             u, euler = imgui.drag_float3(f"{name}##joint{j}", *euler, 0.1, format="%.3f")
             if not self._edit_local_axes and u:
                 aa = euler2aa_numpy(np.array(euler), degrees=True)
-                self._edit_pose[j * 3 : (j + 1) * 3] = torch.from_numpy(aa)
+                self._edit_pose[pose_idx * 3 : (pose_idx + 1) * 3] = torch.from_numpy(aa)
                 self._edit_pose_dirty = True
                 self.redraw(current_frame_only=True)
 
@@ -646,8 +891,54 @@ class SMPLSequence(Node):
                     self._gui_joint(imgui, c, tree)
                 imgui.tree_pop()
 
+    def _apply_to_all_with_hands(self):
+        """Apply current edit pose to all frames for SMPLX/SMPLH models."""
+        # Calculate relative rotation for root and body only
+        edit_rots = Rotation.from_rotvec(np.reshape(self._edit_pose.cpu().numpy(), (-1, 3)))
+        base_pose_parts = [self.poses_root[self.current_frame_id], self.poses_body[self.current_frame_id]]
+        base_pose = torch.cat(base_pose_parts, dim=-1)
+        base_rots = Rotation.from_rotvec(np.reshape(base_pose.cpu().numpy(), (-1, 3)))
+        # Only use root + body for relative calculation (22 rotations: root + 21 body joints)
+        relative = edit_rots[:22] * base_rots.inv()
+
+        for i in range(self.n_frames):
+            root = Rotation.from_rotvec(np.reshape(self.poses_root[i].cpu().numpy(), (-1, 3)))
+            self.poses_root[i] = torch.from_numpy((relative[0] * root).as_rotvec().flatten())
+
+            body = Rotation.from_rotvec(np.reshape(self.poses_body[i].cpu().numpy(), (-1, 3)))
+            self.poses_body[i] = torch.from_numpy((relative[1:] * body).as_rotvec().flatten())
+
+        # Apply hand poses directly (no relative rotation)
+        body_size = self.poses_body.shape[1]
+        offset = 3 + body_size
+        if self.poses_left_hand is not None:
+            hand_size = self.poses_left_hand.shape[1]
+            for i in range(self.n_frames):
+                self.poses_left_hand[i] = self._edit_pose[offset:offset+hand_size]
+            offset += hand_size
+
+        if self.poses_right_hand is not None:
+            hand_size = self.poses_right_hand.shape[1]
+            for i in range(self.n_frames):
+                self.poses_right_hand[i] = self._edit_pose[offset:offset+hand_size]
+
+    def _apply_to_all_standard(self):
+        """Apply current edit pose to all frames for standard SMPL models."""
+        edit_rots = Rotation.from_rotvec(np.reshape(self._edit_pose.cpu().numpy(), (-1, 3)))
+        base_rots = Rotation.from_rotvec(np.reshape(self.poses[self.current_frame_id].cpu().numpy(), (-1, 3)))
+        relative = edit_rots * base_rots.inv()
+        for i in range(self.n_frames):
+            root = Rotation.from_rotvec(np.reshape(self.poses_root[i].cpu().numpy(), (-1, 3)))
+            self.poses_root[i] = torch.from_numpy((relative[0] * root).as_rotvec().flatten())
+
+            body = Rotation.from_rotvec(np.reshape(self.poses_body[i].cpu().numpy(), (-1, 3)))
+            self.poses_body[i] = torch.from_numpy((relative[1:] * body).as_rotvec().flatten())
+
     def gui_mode_edit(self, imgui):
-        skel = self.smpl_layer.skeletons()["body"].cpu().numpy()
+        if self.smpl_layer.model_type in ["smplx", "smplh"]:
+            skel = self.smpl_layer.skeletons()["all"].cpu().numpy()
+        else:
+            skel = self.smpl_layer.skeletons()["body"].cpu().numpy()
 
         tree = {}
         for i in range(skel.shape[1]):
@@ -664,25 +955,32 @@ class SMPLSequence(Node):
 
         if imgui.button("Apply"):
             self.poses_root[self.current_frame_id] = self._edit_pose[:3]
-            self.poses_body[self.current_frame_id] = self._edit_pose[3:]
+            if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                body_size = self.poses_body.shape[1]
+                self.poses_body[self.current_frame_id] = self._edit_pose[3:3+body_size]
+                offset = 3 + body_size
+                if self.poses_left_hand is not None:
+                    hand_size = self.poses_left_hand.shape[1]
+                    self.poses_left_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+                    offset += hand_size
+                if self.poses_right_hand is not None:
+                    hand_size = self.poses_right_hand.shape[1]
+                    self.poses_right_hand[self.current_frame_id] = self._edit_pose[offset:offset+hand_size]
+            else:
+                self.poses_body[self.current_frame_id] = self._edit_pose[3:]
             self._edit_pose_dirty = False
             self.redraw(current_frame_only=True)
         imgui.same_line()
         if imgui.button("Apply to all"):
-            edit_rots = Rotation.from_rotvec(np.reshape(self._edit_pose.cpu().numpy(), (-1, 3)))
-            base_rots = Rotation.from_rotvec(np.reshape(self.poses[self.current_frame_id].cpu().numpy(), (-1, 3)))
-            relative = edit_rots * base_rots.inv()
-            for i in range(self.n_frames):
-                root = Rotation.from_rotvec(np.reshape(self.poses_root[i].cpu().numpy(), (-1, 3)))
-                self.poses_root[i] = torch.from_numpy((relative[0] * root).as_rotvec().flatten())
-
-                body = Rotation.from_rotvec(np.reshape(self.poses_body[i].cpu().numpy(), (-1, 3)))
-                self.poses_body[i] = torch.from_numpy((relative[1:] * body).as_rotvec().flatten())
+            if self.smpl_layer.model_type in ["smplx", "smplh"]:
+                self._apply_to_all_with_hands()
+            else:
+                self._apply_to_all_standard()
             self._edit_pose_dirty = False
             self.redraw()
         imgui.same_line()
         if imgui.button("Reset"):
-            self._edit_pose = self.poses[self.current_frame_id]
+            self._edit_pose = self._build_edit_pose()
             self._edit_pose_dirty = False
             self.redraw(current_frame_only=True)
 
