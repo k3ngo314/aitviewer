@@ -34,7 +34,7 @@ class SMPLLayer(nn.Module, ABC):
         :param dtype: The pytorch floating point data type.
         :param smpl_model_params: Other keyword arguments that can be passed to smplx.create.
         """
-        assert model_type in ["smpl", "smplh", "smplx", "mano", "flame"]
+        assert model_type in ["smpl", "smplh", "smplx", "flame"]
         assert gender in ["male", "female", "neutral"]
         if model_type == "smplh" and gender == "neutral":
             gender = "female"  # SMPL-H has no neutral gender.
@@ -236,55 +236,177 @@ class SMPLLayer(nn.Module, ABC):
 
         return output.vertices, output.joints
 
-    def fk_mano(
+    def forward(self, *args, **kwargs):
+        """
+        Forward pass using forward kinematics
+        """
+        return self.fk(*args, **kwargs)
+
+
+class MANOLayer(nn.Module, ABC):
+    """A wrapper for the MANO hand model."""
+
+    def __init__(
         self,
-        hand_pose,
-        betas,
-        global_orient=None,
-        trans=None,
-        normalize_root=False,
-        mano=True,
+        num_betas=10,
+        is_rhand=True,
+        device=None,
+        dtype=None,
+        **mano_model_params,
     ):
         """
-        Convert mano pose data (joint angles and shape parameters) to positional data (joint and mesh vertex positions).
-        :param hand_pose: A tensor of shape (N, N_JOINTS*3), i.e. joint angles in angle-axis format or PCA format (N, N_PCA_COMPONENTS). This contains all
-          body joints which are not the root.
-        :param betas: A tensor of shape (N, N_BETAS) containing the betas/shape parameters.
-        :param global_orient: Orientation of the root or None. If specified expected shape is (N, 3).
-        :param trans: translation that is applied to vertices and joints or None, this is the 'transl' parameter
+        Initializer.
+        :param num_betas: Number of shape components.
+        :param is_rhand: Whether to load the right hand model. If False, the left hand model is loaded.
+        :param device: CPU or GPU.
+        :param dtype: The pytorch floating point data type.
+        :param mano_model_params: Other keyword arguments that can be passed to smplx.create.
+        """
+
+        super(MANOLayer, self).__init__()
+        self.num_betas = num_betas
+        self.model_type = "mano"
+
+        mano_model_params["use_pca"] = mano_model_params.get("use_pca", False)
+        mano_model_params["flat_hand_mean"] = mano_model_params.get("flat_hand_mean", True)
+
+        self.bm = smplx.create(
+            C.smplx_models,
+            model_type="mano",
+            num_betas=self.num_betas,
+            is_rhand=is_rhand,
+            **mano_model_params,
+        )
+
+        if device is None:
+            device = C.device
+        if dtype is None:
+            dtype = C.f_precision
+        self.bm.to(device=device, dtype=dtype)
+
+        self._parents = None
+        self._children = None
+        self._closest_joints = None
+        self._vertex_faces = None
+        self._faces = None
+
+    @property
+    def faces(self):
+        """Return the definition of the faces."""
+        if self._faces is None:
+            self._faces = torch.from_numpy(self.bm.faces.astype(np.int32))
+        return self._faces
+
+    @property
+    def parents(self):
+        """Return how the joints are connected in the kinematic chain where parents[i, 0] is the parent of
+        joint parents[i, 1]."""
+        if self._parents is None:
+            self._parents = self.bm.kintree_table.transpose(0, 1).cpu().numpy()
+        return self._parents
+
+    @property
+    def joint_children(self):
+        """Return the children of each joint in the kinematic chain."""
+        if self._children is None:
+            self._children = collections.defaultdict(list)
+            for bone in self.parents:
+                if bone[0] != -1:
+                    self._children[bone[0]].append(bone[1])
+        return self._children
+
+    def vertex_faces(self, vertices):
+        """Return a matrix that returns a list of faces each vertex is contributing to. `vertices` should have
+        have shape (V, 3)."""
+        if self._vertex_faces is None:
+            import trimesh
+
+            mesh = trimesh.Trimesh(vertices.detach().cpu().numpy(), self.faces.cpu().numpy(), process=False)
+            self._vertex_faces = torch.from_numpy(np.copy(mesh.vertex_faces)).to(
+                dtype=torch.long, device=vertices.device
+            )
+        return self._vertex_faces
+
+    def vertex_normals(self, vertices, output_vertex_ids=None):
+        """
+        Return the unnormalized vertex normals at the provided vertex IDs.
+        :param vertices: A tensor of shape (N, V, 3).
+        :param output_vertex_ids: An optional list of integers indexing into the 2nd dimension of `vertices`.
+        :return: A tensor of shape (N, V', 3) where V' is either V or len(output_vertex_ids).
+        """
+        normals, _ = compute_vertex_and_face_normals_torch(vertices, self.faces, self.vertex_faces(vertices[0]))
+        if output_vertex_ids is not None:
+            return normals[:, output_vertex_ids]
+        else:
+            return normals
+
+    def skeletons(self):
+        """Return how the joints are connected in the kinematic chain where skeleton[0, i] is the parent of
+        joint skeleton[1, i]."""
+        parents = torch.stack(
+            [
+                self.bm.parents,
+                torch.arange(0, len(self.bm.parents), device=self.bm.parents.device),
+            ]
+        )
+        return {
+            "all": parents,
+            "body": parents,  # For MANO, body and all are the same
+            "hands": parents,  # For MANO, hands and all are the same
+        }
+
+    def fk(
+        self,
+        poses_hand,
+        betas,
+        poses_root=None,
+        trans=None,
+        normalize_root=False,
+    ):
+        """
+        Convert hand pose data (joint angles and shape parameters) to positional data (joint and mesh vertex positions).
+        :param poses_hand: A tensor of shape (N, N_JOINTS*3), i.e. joint angles in angle-axis format. This contains all
+          hand joints.
+        :param betas: A tensor of shape (N, N_BETAS) containing the betas/shape parameters, i.e. shape parameters can
+          differ for every sample. If N_BETAS > self.num_betas, the excessive shape parameters will be ignored.
+        :param poses_root: Orientation of the root or None. If specified expected shape is (N, 3).
+        :param trans: Translation that is applied to vertices and joints or None, this is the 'transl' parameter
           of the MANO Model. If specified expected shape is (N, 3).
         :param normalize_root: If set, it will normalize the root such that its orientation is the identity in the
           first frame and its position starts at the origin.
         :return: The resulting vertices and joints.
         """
+        assert poses_hand.shape[1] == self.bm.NUM_HAND_JOINTS * 3
 
-        batch_size = hand_pose.shape[0]
-        device = hand_pose.device
+        batch_size = poses_hand.shape[0]
+        device = poses_hand.device
 
-        if global_orient is None:
-            global_orient = torch.zeros([batch_size, 3]).to(dtype=hand_pose.dtype, device=device)
+        if poses_root is None:
+            poses_root = torch.zeros([batch_size, 3]).to(dtype=poses_hand.dtype, device=device)
         if trans is None:
-            trans = torch.zeros([batch_size, 3]).to(dtype=hand_pose.dtype, device=device)
+            trans = torch.zeros([batch_size, 3]).to(dtype=poses_hand.dtype, device=device)
+        if betas is None:
+            betas = torch.zeros([batch_size, self.num_betas]).to(dtype=poses_hand.dtype, device=device)
 
         # Batch shapes if they don't match batch dimension.
         if len(betas.shape) == 1 or betas.shape[0] == 1:
-            betas = betas.repeat(hand_pose.shape[0], 1)
+            betas = betas.repeat(poses_hand.shape[0], 1)
         betas = betas[:, : self.num_betas]
 
         if normalize_root:
             # Make everything relative to the first root orientation.
-            root_ori = aa2rot(global_orient)
+            root_ori = aa2rot(poses_root)
             first_root_ori = torch.inverse(root_ori[0:1])
             root_ori = torch.matmul(first_root_ori, root_ori)
-            global_orient = rot2aa(root_ori)
+            poses_root = rot2aa(root_ori)
             trans = torch.matmul(first_root_ori.unsqueeze(0), trans.unsqueeze(-1)).squeeze()
             trans = trans - trans[0:1]
 
         output = self.bm(
-            hand_pose=hand_pose,
             betas=betas,
-            global_orient=global_orient,
+            global_orient=poses_root,
             transl=trans,
+            hand_pose=poses_hand
         )
 
         return output.vertices, output.joints
@@ -293,8 +415,4 @@ class SMPLLayer(nn.Module, ABC):
         """
         Forward pass using forward kinematics
         """
-
-        if "mano" in kwargs.keys():
-            return self.fk_mano(*args, **kwargs)
-        else:
-            return self.fk(*args, **kwargs)
+        return self.fk(*args, **kwargs)

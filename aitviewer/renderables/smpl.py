@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 from smplx.joint_names import JOINT_NAMES, SMPLH_JOINT_NAMES
 
 from aitviewer.configuration import CONFIG as C
-from aitviewer.models.smpl import SMPLLayer
+from aitviewer.models.smpl import MANOLayer, SMPLLayer
 from aitviewer.renderables.meshes import Meshes
 from aitviewer.renderables.rigid_bodies import RigidBodies
 from aitviewer.renderables.skeletons import Skeletons
@@ -27,6 +27,15 @@ from aitviewer.utils.so3 import (
 )
 from aitviewer.utils.so3 import rot2aa_torch as rot2aa
 
+# MANO joint names (wrist + 15 hand joints)
+MANO_JOINT_NAMES = [
+    'wrist',
+    'index_mcp', 'index_pip', 'index_dip',
+    'middle_mcp', 'middle_pip', 'middle_dip',
+    'pinky_mcp', 'pinky_pip', 'pinky_dip',
+    'ring_mcp', 'ring_pip', 'ring_dip',
+    'thumb_cmc', 'thumb_mcp', 'thumb_ip',
+]
 
 class SMPLSequence(Node):
     """
@@ -62,6 +71,8 @@ class SMPLSequence(Node):
         :param betas: An array (numpy or pytorch) of shape (N_BETAS, ) containing the shape parameters.
         :param trans: An array (numpy or pytorch) of shape (F, 3) containing a global translation that is applied to
           all joints and vertices.
+        :param poses_left_hand: An array (numpy or pytorch) of shape (F, 15*3) containing the left hand pose parameters.
+        :param poses_right_hand: An array (numpy or pytorch) of shape (F, 15*3) containing the right hand pose parameters.
         :param device: The pytorch device for computations.
         :param dtype: The pytorch data type.
         :param include_root: Whether or not to include root information. If False, no root translation and no root
@@ -82,9 +93,7 @@ class SMPLSequence(Node):
         assert len(poses_body.shape) == 2
 
         # Set model icon
-        if smpl_layer.model_type == "mano":
-            icon = "\u0092"
-        elif smpl_layer.model_type == "flame":
+        if smpl_layer.model_type == "flame":
             icon = "\u0091"
 
         if device is None:
@@ -157,18 +166,11 @@ class SMPLSequence(Node):
 
         # First convert the relative joint angles to global joint angles in rotation matrix form.
         if self.smpl_layer.model_type != "flame":
-            if self.smpl_layer.model_type != "mano":
-                global_oris = local_to_global(
-                    torch.cat([self.poses_root, self.poses_body, self.poses_left_hand, self.poses_right_hand], dim=-1),
-                    self.skeleton[:, 0],
-                    output_format="rotmat",
-                )
-            else:
-                global_oris = local_to_global(
-                    torch.cat([self.poses_root, self.poses_body], dim=-1),
-                    self.skeleton[:, 0],
-                    output_format="rotmat",
-                )
+            global_oris = local_to_global(
+                torch.cat([self.poses_root, self.poses_body], dim=-1),
+                self.skeleton[:, 0],
+                output_format="rotmat",
+            )
             global_oris = c2c(global_oris.reshape((self.n_frames, -1, 3, 3)))
         else:
             global_oris = np.tile(np.eye(3), self.joints.shape[:-1])[np.newaxis]
@@ -176,9 +178,8 @@ class SMPLSequence(Node):
         if self._z_up and not C.z_up:
             self.rotation = np.matmul(np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]), self.rotation)
 
-        if self.smpl_layer.model_type != "mano":
-            self.rbs = RigidBodies(self.joints, global_oris, length=0.1, gui_affine=False, name="Joint Angles")
-            self._add_node(self.rbs, enabled=self._show_joint_angles)
+        self.rbs = RigidBodies(self.joints, global_oris, length=0.1, gui_affine=False, name="Joint Angles")
+        self._add_node(self.rbs, enabled=self._show_joint_angles)
 
         self.mesh_seq = Meshes(
             self.vertices,
@@ -405,33 +406,20 @@ class SMPLSequence(Node):
             trans = self.trans
             betas = self.betas
 
-        if self.smpl_layer.model_type == "mano":
-            verts, joints = self.smpl_layer(
-                hand_pose=poses_body,
-                betas=betas,
-                global_orient=poses_root,
-                trans=trans,
-                mano=True,
-            )
-        else:
-            verts, joints = self.smpl_layer(
-                poses_root=poses_root,
-                poses_body=poses_body,
-                poses_left_hand=poses_left_hand,
-                poses_right_hand=poses_right_hand,
-                betas=betas,
-                trans=trans,
-            )
+        verts, joints = self.smpl_layer(
+            poses_root=poses_root,
+            poses_body=poses_body,
+            poses_left_hand=poses_left_hand,
+            poses_right_hand=poses_right_hand,
+            betas=betas,
+            trans=trans,
+        )
 
         # Apply post_fk_func if specified.
         if self.post_fk_func:
             verts, joints = self.post_fk_func(self, verts, joints, current_frame_only)
 
-        skeleton = (
-            self.smpl_layer.skeletons()["body"].T
-            if not self.smpl_layer.model_type == "mano"
-            else self.smpl_layer.skeletons()["all"].T
-        )
+        skeleton = self.smpl_layer.skeletons()["body"].T
         faces = self.smpl_layer.bm.faces.astype(np.int64)
         joints = joints[:, : skeleton.shape[0]]
 
@@ -802,4 +790,597 @@ class SMPLSequence(Node):
             self.betas = self.betas[frames_to_keep]
 
         self.n_frames = len(self.poses_body)
+        self.redraw()
+
+
+class MANOSequence(Node):
+    """
+    Represents a temporal sequence of MANO hand poses. Can be loaded from disk or initialized from memory.
+    """
+
+    def __init__(
+        self,
+        poses_hand,
+        mano_layer,
+        poses_root=None,
+        betas=None,
+        trans=None,
+        device=None,
+        dtype=None,
+        include_root=True,
+        normalize_root=False,
+        is_rigged=True,
+        show_joint_angles=False,
+        z_up=False,
+        post_fk_func=None,
+        icon="\u0092",
+        **kwargs,
+    ):
+        """
+        Initializer.
+        :param poses_hand: An array (numpy or pytorch) of shape (F, 15*3) or (F, num_pca_comps) containing the hand pose parameters.
+        :param mano_layer: The MANO layer that maps parameters to joint positions and/or dense surfaces.
+        :param poses_root: An array (numpy or pytorch) of shape (F, 3) containing the global root orientation.
+        :param betas: An array (numpy or pytorch) of shape (N_BETAS, ) containing the shape parameters.
+        :param trans: An array (numpy or pytorch) of shape (F, 3) containing a global translation that is applied to
+          all joints and vertices.
+        :param device: The pytorch device for computations.
+        :param dtype: The pytorch data type.
+        :param include_root: Whether or not to include root information. If False, no root translation and no root
+          rotation is applied.
+        :param normalize_root: Whether or not to normalize the root. If True, the global root translation in the first
+          frame is zero and the global root orientation is the identity.
+        :param is_rigged: Whether or not to display the joints as a skeleton.
+        :param show_joint_angles: Whether or not the coordinate frames at the joints should be visualized.
+        :param z_up: Whether or not the input data assumes Z is up. If so, the data will be rotated such that Y is up.
+        :param post_fk_func: User specified postprocessing function that is called after evaluating the MANO model,
+          the function signature must be: def post_fk_func(self, vertices, joints, current_frame_only),
+          and it must return new values for vertices and joints with the same shapes.
+          Shapes are:
+            if current_frame_only is False: vertices (F, V, 3) and joints (F, N_JOINTS, 3)
+            if current_frame_only is True:  vertices (1, V, 3) and joints (1, N_JOINTS, 3)
+        :param kwargs: Remaining arguments for rendering.
+        """
+        assert len(poses_hand.shape) == 2
+
+        if device is None:
+            device = C.device
+        if dtype is None:
+            dtype = C.f_precision
+
+        super(MANOSequence, self).__init__(n_frames=poses_hand.shape[0], icon=icon, gui_material=False, **kwargs)
+
+        self.mano_layer = mano_layer
+        self.post_fk_func = post_fk_func
+        self.dtype = dtype
+        self.device = device
+
+        self.poses_hand = to_torch(poses_hand, dtype=dtype, device=device)
+
+        poses_root = poses_root if poses_root is not None else torch.zeros([len(poses_hand), 3])
+        betas = betas if betas is not None else torch.zeros([1, self.mano_layer.num_betas])
+        trans = trans if trans is not None else torch.zeros([len(poses_hand), 3])
+
+        self.poses_root = to_torch(poses_root, dtype=dtype, device=device)
+        self.betas = to_torch(betas, dtype=dtype, device=device)
+        self.trans = to_torch(trans, dtype=dtype, device=device)
+
+        if len(self.betas.shape) == 1:
+            self.betas = self.betas.unsqueeze(0)
+
+        self._include_root = include_root
+        self._normalize_root = normalize_root
+        self._show_joint_angles = show_joint_angles
+        self._is_rigged = is_rigged or show_joint_angles
+        self._render_kwargs = kwargs
+        self._z_up = z_up
+
+        if not self._include_root:
+            self.poses_root = torch.zeros_like(self.poses_root)
+            self.trans = torch.zeros_like(self.trans)
+
+        if self._normalize_root:
+            root_ori = aa2rot(self.poses_root)
+            first_root_ori = torch.inverse(root_ori[0:1])
+            root_ori = torch.matmul(first_root_ori, root_ori)
+            self.poses_root = rot2aa(root_ori)
+
+            trans = torch.matmul(first_root_ori.unsqueeze(0), self.trans.unsqueeze(-1)).squeeze()
+            self.trans = trans - trans[0:1]
+
+        # Edit mode
+        self.gui_modes.update({"edit": {"title": " Edit", "fn": self.gui_mode_edit, "icon": "\u0081"}})
+
+        self._edit_joint = None
+        self._edit_pose = None
+        self._edit_pose_dirty = False
+        self._edit_local_axes = True
+
+        # Nodes
+        self.vertices, self.joints, self.faces, self.skeleton = self.fk()
+
+        if self._is_rigged:
+            self.skeleton_seq = Skeletons(
+                self.joints,
+                self.skeleton,
+                radius=0.005,
+                gui_affine=False,
+                color=(1.0, 177 / 255, 1 / 255, 1.0),
+                name="Skeleton",
+            )
+            self._add_node(self.skeleton_seq)
+
+        # First convert the relative joint angles to global joint angles in rotation matrix form.
+        global_oris = local_to_global(
+            torch.cat([self.poses_root, self.poses_hand], dim=-1),
+            self.skeleton[:, 0],
+            output_format="rotmat",
+        )
+        global_oris = c2c(global_oris.reshape((self.n_frames, -1, 3, 3)))
+
+        if self._z_up and not C.z_up:
+            self.rotation = np.matmul(np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]), self.rotation)
+
+        # Use smaller size for MANO model
+        self.rbs = RigidBodies(self.joints, global_oris, radius=0.005, length=0.03, gui_affine=False, name="Joint Angles")
+        self._add_node(self.rbs, enabled=self._show_joint_angles)
+
+        self.mesh_seq = Meshes(
+            self.vertices,
+            self.faces,
+            is_selectable=False,
+            gui_affine=False,
+            color=kwargs.get("color", (160 / 255, 160 / 255, 160 / 255, 1.0)),
+            name="Mesh",
+        )
+        self._add_node(self.mesh_seq)
+
+        # Save view mode state to restore when exiting edit mode.
+        self._view_mode_color = self.mesh_seq.color
+        self._view_mode_joint_angles = self._show_joint_angles
+
+    @classmethod
+    def t_pose(cls, mano_layer=None, betas=None, frames=1, **kwargs):
+        """Creates a MANO sequence whose single frame is a MANO mesh in T-Pose."""
+
+        if mano_layer is None:
+            mano_layer = MANOLayer()
+
+        poses_hand = np.zeros([frames, mano_layer.bm.num_pca_comps if mano_layer.bm.use_pca else 45])
+        return cls(poses_hand, mano_layer, betas=betas, **kwargs)
+
+    @classmethod
+    def from_npz(cls, file: Union[IO, str], mano_layer: MANOLayer = None, **kwargs):
+        """Creates a MANO sequence from a .npz file exported through the 'export' function."""
+        if mano_layer is None:
+            mano_layer = MANOLayer()
+
+        data = np.load(file)
+
+        return cls(
+            mano_layer=mano_layer,
+            poses_hand=data["poses_hand"],
+            poses_root=data["poses_root"],
+            betas=data["betas"],
+            trans=data["trans"],
+            **kwargs,
+        )
+
+    def export_to_npz(self, file: Union[IO, str]):
+        np.savez(
+            file,
+            poses_hand=c2c(self.poses_hand),
+            poses_root=c2c(self.poses_root),
+            betas=c2c(self.betas),
+            trans=c2c(self.trans),
+        )
+
+    @property
+    def color(self):
+        return self.mesh_seq.color
+
+    @color.setter
+    def color(self, color):
+        self.mesh_seq.color = color
+
+    @property
+    def bounds(self):
+        return self.mesh_seq.bounds
+
+    @property
+    def current_bounds(self):
+        return self.mesh_seq.current_bounds
+
+    @property
+    def vertex_normals(self):
+        return self.mesh_seq.vertex_normals
+
+    @property
+    def poses(self):
+        return torch.cat((self.poses_root, self.poses_hand), dim=-1)
+
+    @property
+    def _edit_mode(self):
+        return self.selected_mode == "edit"
+
+    def fk(self, current_frame_only=False):
+        """Get joints and/or vertices from the poses."""
+        if current_frame_only:
+            # Use current frame data.
+            if self._edit_mode:
+                poses_root = self._edit_pose[:3][None, :]
+                poses_hand = self._edit_pose[3:][None, :]
+            else:
+                poses_hand = self.poses_hand[self.current_frame_id][None, :]
+                poses_root = self.poses_root[self.current_frame_id][None, :]
+
+            trans = self.trans[self.current_frame_id][None, :]
+
+            if self.betas.shape[0] == self.n_frames:
+                betas = self.betas[self.current_frame_id][None, :]
+            else:
+                betas = self.betas
+        else:
+            # Use the whole sequence.
+            if self._edit_mode:
+                poses_root = self.poses_root.clone()
+                poses_hand = self.poses_hand.clone()
+
+                poses_root[self.current_frame_id] = self._edit_pose[:3]
+                poses_hand[self.current_frame_id] = self._edit_pose[3:]
+            else:
+                poses_hand = self.poses_hand
+                poses_root = self.poses_root
+
+            trans = self.trans
+            betas = self.betas
+
+        verts, joints = self.mano_layer(
+            poses_root=poses_root,
+            poses_hand=poses_hand,
+            betas=betas,
+            trans=trans,
+        )
+
+        # Apply post_fk_func if specified.
+        if self.post_fk_func:
+            verts, joints = self.post_fk_func(self, verts, joints, current_frame_only)
+
+        skeleton = self.mano_layer.skeletons()["all"].T
+        faces = self.mano_layer.bm.faces.astype(np.int64)
+        joints = joints[:, : skeleton.shape[0]]
+
+        if current_frame_only:
+            return c2c(verts)[0], c2c(joints)[0], c2c(faces), c2c(skeleton)
+        else:
+            return c2c(verts), c2c(joints), c2c(faces), c2c(skeleton)
+
+    @hooked
+    def on_before_frame_update(self):
+        if self._edit_mode and self._edit_pose_dirty:
+            self._edit_pose = self.poses[self.current_frame_id].clone()
+            self.redraw(current_frame_only=True)
+            self._edit_pose_dirty = False
+
+    @hooked
+    def on_frame_update(self):
+        if self.edit_mode:
+            self._edit_pose = self.poses[self.current_frame_id].clone()
+            self._edit_pose_dirty = False
+
+    def redraw(self, **kwargs):
+        current_frame_only = kwargs.get("current_frame_only", False)
+
+        # Use the edited pose if in edit mode.
+        vertices, joints, self.faces, self.skeleton = self.fk(current_frame_only)
+
+        if current_frame_only:
+            self.vertices[self.current_frame_id] = vertices
+            self.joints[self.current_frame_id] = joints
+
+            if self._is_rigged:
+                self.skeleton_seq.current_joint_positions = joints
+
+            # Use current frame data.
+            if self._edit_mode:
+                pose = self._edit_pose
+            else:
+                pose = torch.cat(
+                    [
+                        self.poses_root[self.current_frame_id],
+                        self.poses_hand[self.current_frame_id],
+                    ],
+                    dim=-1,
+                )
+
+            # Update rigid bodies.
+            global_oris = local_to_global(pose, self.skeleton[:, 0], output_format="rotmat")
+            global_oris = global_oris.reshape((-1, 3, 3))
+            self.rbs.current_rb_ori = c2c(global_oris)
+            self.rbs.current_rb_pos = self.joints[self.current_frame_id]
+
+            # Update mesh.
+            self.mesh_seq.current_vertices = vertices
+        else:
+            self.vertices = vertices
+            self.joints = joints
+
+            # Update skeleton.
+            if self._is_rigged:
+                self.skeleton_seq.joint_positions = self.joints
+
+            # Extract poses including the edited pose.
+            if self._edit_mode:
+                poses_root = self.poses_root.clone()
+                poses_hand = self.poses_hand.clone()
+
+                poses_root[self.current_frame_id] = self._edit_pose[:3]
+                poses_hand[self.current_frame_id] = self._edit_pose[3:]
+            else:
+                poses_hand = self.poses_hand
+                poses_root = self.poses_root
+
+            # Update rigid bodies.
+            global_oris = local_to_global(
+                torch.cat([poses_root, poses_hand], dim=-1),
+                self.skeleton[:, 0],
+                output_format="rotmat",
+            )
+            global_oris = global_oris.reshape((self.n_frames, -1, 3, 3))
+            self.rbs.rb_ori = c2c(global_oris)
+            self.rbs.rb_pos = self.joints
+
+            # Update mesh
+            self.mesh_seq.vertices = vertices
+
+        super().redraw(**kwargs)
+
+    @property
+    def edit_mode(self):
+        return self._edit_mode
+
+    @property
+    def selected_mode(self):
+        return self._selected_mode
+
+    @selected_mode.setter
+    def selected_mode(self, selected_mode):
+        if self._selected_mode == selected_mode:
+            return
+        self._selected_mode = selected_mode
+
+        if self.selected_mode == "edit":
+            self.rbs.enabled = True
+            self.rbs.is_selectable = False
+            self._edit_pose = self.poses[self.current_frame_id].clone()
+
+            # Disable picking for the mesh
+            self.mesh_seq.backface_fragmap = True
+            self.rbs.color = (1, 0, 0.5, 1.0)
+            self._view_mode_color = self.mesh_seq.color
+            self.mesh_seq.color = (
+                *self._view_mode_color[:3],
+                min(self._view_mode_color[3], 0.5),
+            )
+        else:
+            self.mesh_seq.backface_fragmap = False
+            self.mesh_seq.color = self._view_mode_color
+
+            self.rbs.color = (0, 1, 0.5, 1.0)
+            self.rbs.enabled = self._view_mode_joint_angles
+            self.rbs.is_selectable = True
+
+        self.redraw(current_frame_only=True)
+
+    def _gui_joint(self, imgui, j, tree=None):
+        name = "unknown"
+        if j < len(MANO_JOINT_NAMES):
+            name = MANO_JOINT_NAMES[j]
+
+        if tree:
+            e = imgui.tree_node(f"{j} - {name}")
+        else:
+            e = True
+            imgui.text(f"{j} - {name}")
+
+        if e:
+            # Euler angles sliders.
+            aa = self._edit_pose[j * 3 : (j + 1) * 3].cpu().numpy()
+            euler = aa2euler_numpy(aa, degrees=True)
+
+            _, self._edit_local_axes = imgui.checkbox("Local axes", self._edit_local_axes)
+
+            # If we are editing local axes generate an empty slider on top
+            # of the euler angle sliders to capture the input of the slider
+            # without modifying the euler angle values.
+            if self._edit_local_axes:
+                # Get the current draw position.
+                pos = imgui.get_cursor_position()
+
+                # Make the next widget transparent.
+                imgui.push_style_var(imgui.STYLE_ALPHA, 0.0)
+                u, new_euler = imgui.drag_float3(f"", 0, 0, 0, 0.003, format="")
+                imgui.pop_style_var()
+
+                if u:
+                    base = Rotation.from_rotvec(aa)
+                    for i in range(3):
+                        delta = new_euler[i]
+                        if delta == 0:
+                            continue
+
+                        # Get the world coordinates of the current axis from the
+                        # respective column of the rotation matrix.
+                        axis = Rotation.as_matrix(base)[:, i]
+
+                        # Create a rotation of 'delta[i]' radians around the axis.
+                        rot = Rotation.from_rotvec(axis * delta)
+
+                        # Rotate the current joint and convert back to axis angle.
+                        aa = Rotation.as_rotvec(rot * base)
+
+                        self._edit_pose[j * 3 : (j + 1) * 3] = torch.from_numpy(aa)
+                        self._edit_pose_dirty = True
+                        self.redraw(current_frame_only=True)
+
+                # Reset the draw position so that the next slider is drawn on top of this.
+                imgui.set_cursor_pos(pos)
+
+            name = "Local XYZ" if self._edit_local_axes else "Euler XYZ"
+            u, euler = imgui.drag_float3(f"{name}##joint{j}", *euler, 0.1, format="%.3f")
+            if not self._edit_local_axes and u:
+                aa = euler2aa_numpy(np.array(euler), degrees=True)
+                self._edit_pose[j * 3 : (j + 1) * 3] = torch.from_numpy(aa)
+                self._edit_pose_dirty = True
+                self.redraw(current_frame_only=True)
+
+            if tree:
+                for c in tree.get(j, []):
+                    self._gui_joint(imgui, c, tree)
+                imgui.tree_pop()
+
+    def gui_mode_edit(self, imgui):
+        skel = self.mano_layer.skeletons()["all"].cpu().numpy()
+
+        tree = {}
+        for i in range(skel.shape[1]):
+            if skel[0, i] != -1:
+                tree.setdefault(skel[0, i], []).append(skel[1, i])
+
+        if not tree:
+            return
+
+        if self._edit_joint is None:
+            self._gui_joint(imgui, 0, tree)
+        else:
+            self._gui_joint(imgui, self._edit_joint)
+
+        if imgui.button("Apply"):
+            self.poses_root[self.current_frame_id] = self._edit_pose[:3]
+            self.poses_hand[self.current_frame_id] = self._edit_pose[3:]
+            self._edit_pose_dirty = False
+            self.redraw(current_frame_only=True)
+        imgui.same_line()
+        if imgui.button("Apply to all"):
+            edit_rots = Rotation.from_rotvec(np.reshape(self._edit_pose.cpu().numpy(), (-1, 3)))
+            base_rots = Rotation.from_rotvec(np.reshape(self.poses[self.current_frame_id].cpu().numpy(), (-1, 3)))
+            relative = edit_rots * base_rots.inv()
+            for i in range(self.n_frames):
+                root = Rotation.from_rotvec(np.reshape(self.poses_root[i].cpu().numpy(), (-1, 3)))
+                self.poses_root[i] = torch.from_numpy((relative[0] * root).as_rotvec().flatten())
+
+                hand = Rotation.from_rotvec(np.reshape(self.poses_hand[i].cpu().numpy(), (-1, 3)))
+                self.poses_hand[i] = torch.from_numpy((relative[1:] * hand).as_rotvec().flatten())
+            self._edit_pose_dirty = False
+            self.redraw()
+        imgui.same_line()
+        if imgui.button("Reset"):
+            self._edit_pose = self.poses[self.current_frame_id]
+            self._edit_pose_dirty = False
+            self.redraw(current_frame_only=True)
+
+    def gui_io(self, imgui):
+        if imgui.button("Export sequence to NPZ"):
+            dir = os.path.join(C.export_dir, "MANO")
+            os.makedirs(dir, exist_ok=True)
+            path = os.path.join(dir, self.name + ".npz")
+            self.export_to_npz(path)
+            print(f'Exported MANO sequence to "{path}"')
+
+    def gui_context_menu(self, imgui, x: int, y: int):
+        if self.edit_mode and self._edit_joint is not None:
+            self._gui_joint(imgui, self._edit_joint)
+        else:
+            if imgui.radio_button("View mode", not self.edit_mode):
+                self.selected_mode = "view"
+                imgui.close_current_popup()
+            if imgui.radio_button("Edit mode", self.edit_mode):
+                self.selected_mode = "edit"
+                imgui.close_current_popup()
+
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            super().gui_context_menu(imgui, x, y)
+
+    def on_selection(self, node, instance_id, tri_id):
+        if self.edit_mode:
+            # Index of the joint that is currently being edited.
+            if node != self.mesh_seq:
+                self._edit_joint = instance_id
+                self.rbs.color_one(self._edit_joint, (0.3, 0.4, 1, 1))
+            else:
+                self._edit_joint = None
+                # Reset color of all spheres to the default color
+                self.rbs.color = self.rbs.color
+
+    def render_outline(self, *args, **kwargs):
+        # Only render outline of the mesh, skipping skeleton and rigid bodies.
+        self.mesh_seq.render_outline(*args, **kwargs)
+
+    def add_frames(self, poses_hand, poses_root=None, trans=None, betas=None):
+        # Append poses_hand.
+        if len(poses_hand.shape) == 1:
+            poses_hand = poses_hand[np.newaxis]
+        self.poses_hand = torch.cat((self.poses_hand, to_torch(poses_hand, self.dtype, self.device)))
+
+        # Append poses_root or zeros.
+        if poses_root is None:
+            poses_root = torch.zeros([len(poses_hand), 3])
+        elif len(poses_root.shape) == 1:
+            poses_root = poses_root[np.newaxis]
+        self.poses_root = torch.cat((self.poses_root, to_torch(poses_root, self.dtype, self.device)))
+
+        # Append trans or zeros.
+        if trans is None:
+            trans = torch.zeros([len(poses_hand), 3])
+        elif len(trans.shape) == 1:
+            trans = trans[np.newaxis]
+        self.trans = torch.cat((self.trans, to_torch(trans, self.dtype, self.device)))
+
+        # Append betas or zeros.
+        if betas is None:
+            # If we have only 1 frame of betas we don't need to append zeros, as the first
+            # frame of betas will be broadcasted to all frames.
+            if betas.shape[0] > 1:
+                self.betas = torch.cat(
+                    (
+                        self.betas,
+                        to_torch(
+                            torch.zeros([1, self.mano_layer.num_betas]),
+                            self.dtype,
+                            self.device,
+                        ),
+                    )
+                )
+        else:
+            if len(betas.shape) == 1:
+                betas = betas[np.newaxis]
+            self.betas = torch.cat((self.betas, to_torch(betas, self.dtype, self.device)))
+
+        self.n_frames = len(self.poses_hand)
+        self.redraw()
+
+    def update_frames(self, poses_hand, frames, poses_root=None, trans=None, betas=None):
+        self.poses_hand[frames] = to_torch(poses_hand, self.dtype, self.device)
+        if poses_root is not None:
+            self.poses_root[frames] = to_torch(poses_root, self.dtype, self.device)
+        if trans is not None:
+            self.trans[frames] = to_torch(trans, self.dtype, self.device)
+        if betas is not None:
+            self.betas[frames] = to_torch(betas, self.dtype, self.device)
+        self.redraw()
+
+    def remove_frames(self, frames):
+        frames_to_keep = torch.from_numpy(np.setdiff1d(np.arange(self.n_frames), frames)).to(
+            dtype=torch.long, device=self.device
+        )
+
+        self.poses_hand = self.poses_hand[frames_to_keep]
+        self.poses_root = self.poses_root[frames_to_keep]
+        self.trans = self.trans[frames_to_keep]
+        if self.betas.shape != 1:
+            self.betas = self.betas[frames_to_keep]
+
+        self.n_frames = len(self.poses_hand)
         self.redraw()
